@@ -1,0 +1,260 @@
+---
+title: "Where Does Defensive Value Come From in MLS? A Look at Gameplan Style"
+author: "Alex Bradley"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(ggrepel)
+```
+
+## Research Question
+
+Where does defensive value come from in MLS, and does it differ between gameplan schemes?
+
+This interests me because press intensity is often treated as a proxy for defensive quality in MLS analysis, but it's rarely tested against where defensive value actually comes from. I wanted to see whether teams built around directness and aggressive counterpressing actually generate more defensive output, or whether that's a narrative that doesn't hold up in the data.
+
+## Data Preparation
+
+### Loading the data
+
+Place the season CSV in a `data/` folder at the project root. It is **not** committed to
+git (see README).
+
+```{r load-data}
+df <- read_csv("data/mls_events_2024.csv")
+```
+
+### First look
+
+```{r glimpse}
+glimpse(df)
+```
+
+```{r event-types}
+count(df, event_type, sort = TRUE)
+```
+
+### A schema note before I build anything
+
+The StatsBomb API documentation for this data (v8.0.0) describes several fields —
+`pass_cluster_id`/`pass_cluster_label`/`pass_cluster_probability`,
+`shot_execution_xg`, `shot_execution_xg_uplift`, `gk_positioning_xg_suppression`,
+`gk_shot_stopping_xg_suppression` — that are **not present** in this export, and
+`shot_statsbomb_xg2` still uses its pre-v8 name (renamed to `gk_save_dificulty_xg`
+in v8.0.0). That mismatch suggests this export reflects an earlier data version than
+the documentation describes, so this analysis only relies on fields confirmed present
+in the actual file below.
+
+### Verifying assumptions before using key fields
+
+**`duel_type_name` — what does it actually contain?**
+
+Per the docs, this should only be populated for `Duel` events (values `"Tackle"` or
+`"Aerial Lost"`). Checking that before using it to separate tackles from other
+defensive actions:
+
+```{r check-duel-type}
+count(df, event_type, duel_type_name, sort = TRUE)
+```
+
+**`counterpress` / `under_pressure` — sparse boolean check**
+
+StatsBomb-style exports typically only populate boolean flag columns when `TRUE`,
+leaving them `NA` otherwise (no explicit `FALSE`). Confirming that pattern here,
+since it changes how I'd calculate a rate from these columns:
+
+```{r check-boolean-pattern}
+df %>% count(counterpress, useNA = "always")
+df %>% count(under_pressure, useNA = "always")
+```
+
+**`avevelocity` / `time_in_poss` — possession-level or event-level?**
+
+Checking whether these are constant within a single possession (i.e., a possession-level
+stat repeated on every event row) or genuinely vary event-to-event, since that determines
+whether I should aggregate by possession first or just average across all rows:
+
+```{r check-possession-level}
+df %>%
+  filter(!is.na(avevelocity)) %>%
+  group_by(match_id_statsbomb, possession) %>%
+  summarize(n_distinct_velocity = n_distinct(avevelocity), .groups = "drop") %>%
+  count(n_distinct_velocity)
+```
+
+### What I learned from the checks
+
+- `duel_type_name` mirrors `event_type` for every event type except `Duel`, where it correctly
+  holds `"Tackle"` or `"Aerial Lost"`. So `event_type` alone is enough to select action types;
+  `duel_type_name` is only needed to tell tackles apart from aerial duels within `Duel` events.
+- `counterpress` and `under_pressure` are sparse booleans (`TRUE`/`NA`, no explicit `FALSE`),
+  confirmed. Rates are computed as `mean(!is.na(x))`, not `mean(x, na.rm = TRUE)`.
+- `avevelocity` is constant within a possession ~92% of the time. Averaging per possession
+  first, then per team, handles the small remainder without dropping any data.
+
+### Team directness (attacking style)
+
+```{r team-directness}
+possession_summary <- df %>%
+  filter(!is.na(avevelocity)) %>%
+  group_by(match_id_statsbomb, possession, team) %>%
+  summarize(
+    avevelocity = mean(avevelocity, na.rm = TRUE),
+    time_in_poss = mean(time_in_poss, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+team_directness <- possession_summary %>%
+  group_by(team) %>%
+  summarize(
+    avg_velocity = mean(avevelocity, na.rm = TRUE),
+    avg_time_in_poss = mean(time_in_poss, na.rm = TRUE),
+    n_possessions = n(),
+    .groups = "drop"
+  )
+
+team_directness
+```
+
+### Team press intensity
+
+Per the docs, `counterpress` only applies to these event types: Pressure, Dribbled Past, 50/50,
+Duel, Block, Interception, and non-offensive Foul Committed. The rate needs that as its
+denominator, not every event in the file.
+
+```{r team-press}
+counterpress_eligible <- df %>%
+  filter(event_type %in% c("Pressure", "Dribbled Past", "50/50", "Duel",
+                            "Block", "Interception", "Foul Committed"))
+
+team_press <- counterpress_eligible %>%
+  group_by(team) %>%
+  summarize(
+    counterpress_rate = mean(!is.na(counterpress)),
+    n_eligible_actions = n(),
+    .groups = "drop"
+  )
+
+team_press
+```
+
+### Defensive value by category
+
+I categorized proactive defending as winning the ball before danger develops (Interceptions, and Duels won as Tackles) and reactive defending as stopping danger already in motion (Blocks, Clearances). My reasoning for excluding Aerial Lost duels is covered in Limitations below.
+
+```{r defensive-value}
+defensive_value <- df %>%
+  filter(event_type %in% c("Interception", "Duel", "Block", "Clearance")) %>%
+  mutate(
+    action_category = case_when(
+      event_type == "Interception" ~ "proactive",
+      event_type == "Duel" & duel_type_name == "Tackle" ~ "proactive",
+      # event_type == "Duel" & duel_type_name == "Aerial Lost" ~ "proactive",  # uncomment to include
+      event_type == "Block" ~ "reactive",
+      event_type == "Clearance" ~ "reactive",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(action_category))
+
+team_defensive_value <- defensive_value %>%
+  group_by(team, action_category) %>%
+  summarize(total_obv = sum(obv_for_net, na.rm = TRUE), n_actions = n(), .groups = "drop")
+
+team_defensive_value
+```
+
+### Combining into one team-level profile
+
+```{r team-profile}
+defensive_value_wide <- team_defensive_value %>%
+  pivot_wider(names_from = action_category, values_from = c(total_obv, n_actions), values_fill = 0)
+
+matches_played <- df %>%
+  distinct(team, match_id_statsbomb) %>%
+  count(team, name = "matches_played")
+
+team_profile <- team_directness %>%
+  left_join(team_press, by = "team") %>%
+  left_join(defensive_value_wide, by = "team") %>%
+  left_join(matches_played, by = "team") %>%
+  mutate(
+    proactive_obv_per_match = total_obv_proactive / matches_played,
+    reactive_obv_per_match = total_obv_reactive / matches_played
+  )
+
+team_profile
+```
+
+## Visualizations
+
+### Chart 1: gameplan quadrant — directness vs. press intensity
+
+Dashed lines mark the league-average velocity and press rate, so each team's position relative
+to them shows whether they're more/less direct and more/less press-heavy than the league norm.
+
+```{r chart-quadrant, fig.width=9, fig.height=6.5}
+ggplot(team_profile, aes(x = avg_velocity, y = counterpress_rate)) +
+  geom_vline(xintercept = mean(team_profile$avg_velocity), linetype = "dashed", color = "gray70") +
+  geom_hline(yintercept = mean(team_profile$counterpress_rate), linetype = "dashed", color = "gray70") +
+  geom_point(size = 3, color = "#1D9E75") +
+  geom_text_repel(aes(label = team), size = 3, max.overlaps = 20, segment.size = 0.2, seed = 42) +
+  scale_x_continuous(expand = expansion(mult = c(0.08, 0.12))) +
+  labs(
+    title = "MLS teams by gameplan: directness vs. press intensity",
+    subtitle = "2024 season",
+    x = "Average ball velocity (higher = more direct)",
+    y = "Counterpress rate (higher = higher press)"
+  ) +
+  theme_minimal()
+```
+
+### Chart 2: where defensive value comes from, by team
+
+```{r chart-defensive-value}
+team_profile_long <- team_profile %>%
+  select(team, proactive_obv_per_match, reactive_obv_per_match) %>%
+  pivot_longer(
+    cols = c(proactive_obv_per_match, reactive_obv_per_match),
+    names_to = "category", values_to = "obv_per_match"
+  ) %>%
+  mutate(category = recode(category,
+    proactive_obv_per_match = "Proactive (interceptions, tackles)",
+    reactive_obv_per_match  = "Reactive (blocks, clearances)"
+  ))
+
+ggplot(team_profile_long, aes(x = reorder(team, obv_per_match, sum), y = obv_per_match, fill = category)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Where MLS teams' defensive value comes from",
+    subtitle = "2024 season, per match",
+    x = NULL, y = "Defensive OBV per match", fill = NULL
+  ) +
+  theme_minimal()
+```
+
+## Findings & Interpretation
+
+Chart 1 clusters or spread? Real clustering on the press axis, a continuum on the directness axis. There's a genuine upper left cluster of indirect, high press teams (DC United, Real Salt Lake, NYCFC, Houston, Cincinnati, Orlando, Minnesota, Colorado, CF Montreal) sitting well above the 0.22 line. Directness, by contrast, is smeared across the x-axis with one team stretching the range dramatically.
+
+Chart 2's pattern: Proactive value (tackles/interceptions) outweighs reactive value (blocks/clearances) for every team in the league, with no exceptions. What differs is the ratio, DC United and San Jose carry the thickest reactive slices, while Atlanta United and CF Montreal's reactive contribution is almost invisible. This is mildly surprising as you'd expect at least a couple of deep block and low press teams to lean reactive, and none do.
+
+Team that stood out: New York Red Bulls, isolated far right (~34.5 ball velocity, next closest team is ~30). Given RBNY's historical identity as the pressing team in MLS, it's notable their counterpress rate here is just middling, as their outlier trait is pure directness, not press intensity.
+
+Coach/GM takeaway: Proactive ball winning is the dominant source of defensive value across the entire league regardless of scheme, so press intensity, not directness, is the lever most worth coaching for if the goal is defensive output.
+
+## Limitations & Next Steps
+
+Missing v8.0.0 fields: The most consequential gap is gk_positioning_xg_suppression and gk_shot_stopping_xg_suppression as both are absent from this export, which means goalkeeper contributions are completely missing from this defensive value analysis. For a question specifically about where defensive value comes from, that's a real blind spot, an elite shot stopper generates defensive value this dataset can't see, since it only captures outfield actions (interceptions, tackles, blocks, clearances). The pass clustering fields (pass_cluster_id/_label/_probability) would also have let me test whether "directness" is really one dimension or several distinct passing styles, rather than collapsing it into a single velocity number. shot_execution_xg and its uplift version are offense side metrics, so their absence doesn't affect this analysis, but would matter for a companion piece on attacking value.
+
+Shakiness in the proactive/reactive split: Two judgment calls are baked in. Aerial Lost duels are excluded from "proactive" even though contesting the ball in the air arguably still counts as proactive defending, and that's a call not a fact, and the code already has a toggle to test how much it moves the numbers. More significant: Ball Recovery isn't pulled into the defensive value calculation at all, so it's not a borderline case, it's fully absent. Recoveries are typically the single most frequent defensive event in a match, so any team whose defense leans on winning second balls rather than clean tackles or picks is likely undercounted here.
+
+One thing to check with more time: Test the quadrant position against proactive share directly (a regression or correlation) instead of inferring the link across two separate charts. And if the full v8.0.0 schema becomes available, re-run defensive value with GK suppression included, as that's probably the single biggest missing piece for a "defensive value" question specifically.
